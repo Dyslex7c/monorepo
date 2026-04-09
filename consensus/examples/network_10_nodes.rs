@@ -56,6 +56,10 @@ const MSG_QUOTA: Quota = Quota::per_second(NonZeroU32::MAX);
 // How often (in finalized views) each node logs its progress.
 const LOG_EVERY_VIEWS: u64 = 10;
 
+// ─── Type aliases ─────────────────────────────────────────────────────────────
+
+type ActiveRelay = Relay<Sha256Digest, PublicKey>;
+
 // ─── Network helpers ──────────────────────────────────────────────────────────
 
 async fn open_channels(
@@ -74,12 +78,18 @@ async fn open_channels(
         commonware_p2p::simulated::Sender<PublicKey, deterministic::Context>,
         commonware_p2p::simulated::Receiver<PublicKey>,
     ),
+    // Channel 3: DA sampling (reserved for FRIDA integration).
+    (
+        commonware_p2p::simulated::Sender<PublicKey, deterministic::Context>,
+        commonware_p2p::simulated::Receiver<PublicKey>,
+    ),
 ) {
-    let ctrl = oracle.control(validator);
-    let votes    = ctrl.register(0, MSG_QUOTA).await.unwrap();
-    let certs    = ctrl.register(1, MSG_QUOTA).await.unwrap();
-    let resolver = ctrl.register(2, MSG_QUOTA).await.unwrap();
-    (votes, certs, resolver)
+    let ctrl        = oracle.control(validator);
+    let votes       = ctrl.register(0, MSG_QUOTA).await.unwrap();
+    let certs       = ctrl.register(1, MSG_QUOTA).await.unwrap();
+    let resolver    = ctrl.register(2, MSG_QUOTA).await.unwrap();
+    let da_sampling = ctrl.register(3, MSG_QUOTA).await.unwrap();
+    (votes, certs, resolver, da_sampling)
 }
 
 async fn register_all(
@@ -88,6 +98,10 @@ async fn register_all(
 ) -> HashMap<
     PublicKey,
     (
+        (
+            commonware_p2p::simulated::Sender<PublicKey, deterministic::Context>,
+            commonware_p2p::simulated::Receiver<PublicKey>,
+        ),
         (
             commonware_p2p::simulated::Sender<PublicKey, deterministic::Context>,
             commonware_p2p::simulated::Receiver<PublicKey>,
@@ -179,14 +193,19 @@ fn main() {
         info!("full-mesh topology established (10ms latency, lossless)");
 
         // ── Shared block relay ────────────────────────────────────────────
-        let relay: Arc<Relay<Sha256Digest, PublicKey>> = Arc::new(Relay::new());
+        let relay: Arc<ActiveRelay> = Arc::new(Relay::new());
 
         // ── Leader election ───────────────────────────────────────────────
         let elector: RoundRobin<Sha256> = RoundRobin::default();
 
         // ── Start all nodes ───────────────────────────────────────────────
-        let mut reporters = Vec::new();
+        let mut reporters     = Vec::new();
         let mut engine_handles = Vec::new();
+        // Collected DA sampling channels, one per node.
+        let mut da_channels: Vec<(
+            commonware_p2p::simulated::Sender<PublicKey, deterministic::Context>,
+            commonware_p2p::simulated::Receiver<PublicKey>,
+        )> = Vec::new();
 
         for (idx, validator) in participants.iter().enumerate() {
             let ctx = context.with_label(&format!("node_{idx}"));
@@ -201,6 +220,8 @@ fn main() {
             );
             reporters.push(reporter.clone());
 
+            let certifier = Certifier::Always;
+
             let (app_actor, app_mailbox) = Application::new(
                 ctx.with_label("application"),
                 AppConfig {
@@ -210,7 +231,7 @@ fn main() {
                     propose_latency: (10.0, 5.0),
                     verify_latency:  (10.0, 5.0),
                     certify_latency: (10.0, 5.0),
-                    should_certify: Certifier::Always,
+                    should_certify: certifier,
                 },
             );
             app_actor.start();
@@ -241,10 +262,13 @@ fn main() {
             };
 
             let engine = Engine::new(ctx.with_label("engine"), cfg);
-            let (vote_net, cert_net, resolver_net) = registrations
+            let (vote_net, cert_net, resolver_net, da_net) = registrations
                 .remove(validator)
                 .expect("validator should have been registered");
+
             engine_handles.push(engine.start(vote_net, cert_net, resolver_net));
+
+            da_channels.push(da_net);
         }
 
         info!("all {N} engines running, network is live");
@@ -289,5 +313,6 @@ fn main() {
         // Unreachable, here only to keep the handles alive until exit.
         drop(engine_handles);
         drop(monitor_handles);
+        drop(da_channels);
     });
 }
